@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -179,6 +179,56 @@ def get_pending_orders_for_user(chat_id: int) -> list:
         return []
 
 
+def get_all_pending_orders() -> list:
+    """Get all orders that are not yet marked as ordered or cancelled."""
+    try:
+        worksheet = get_google_sheet()
+        if not worksheet:
+            return []
+        
+        all_values = worksheet.get_all_values()
+        if len(all_values) <= 1:
+            return []
+        
+        pending = []
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) >= 9:
+                bestellt = row[8].strip().upper()
+                if bestellt == "":
+                    pending.append({
+                        "row": i,
+                        "order_number": row[0],
+                        "timestamp": row[1],
+                        "mitarbeiter": row[2],
+                        "artikel": row[4],
+                        "menge": row[5],
+                        "dringlichkeit": row[6],
+                        "kostenstelle": row[7]
+                    })
+        
+        return pending
+    except Exception as e:
+        logger.error(f"Error getting all pending orders: {e}")
+        return []
+
+
+def update_order_status(row_number: int, status: str) -> bool:
+    """Update order status in column I and set timestamp in column J."""
+    try:
+        worksheet = get_google_sheet()
+        if not worksheet:
+            return False
+            
+        # Column I (9): Status, Column J (10): Timestamp
+        worksheet.update_cell(row_number, 9, status)
+        worksheet.update_cell(row_number, 10, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error updating order status: {e}")
+        return False
+
+
 def cancel_order(row_number: int) -> bool:
     """Cancel an order by marking it as 'STORNIERT'."""
     try:
@@ -301,6 +351,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"(/abbrechen zum Beenden)",
         parse_mode="Markdown"
     )
+
+    # Notify admin when a new user starts the bot
+    if ADMIN_CHAT_ID and str(user.id) != str(ADMIN_CHAT_ID):
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"👤 **Neuer Benutzer:** {user.first_name} (@{user.username or 'kein Username'}) hat den Bot gestartet.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Could not notify admin about new user: {e}")
     
     return ARTIKEL
 
@@ -657,6 +718,125 @@ async def get_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Simple test command to see if bot is alive."""
+    await update.message.reply_text("🤖 Bot ist online! Wenn du das hier siehst, reagiert der Bot auf Befehle.")
+
+
+async def admin_bestellungen_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all pending orders for admin management."""
+    try:
+        chat_id = update.effective_chat.id
+        logger.info(f"Admin command attempted by {chat_id}. Configured ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
+        
+        if not ADMIN_CHAT_ID or str(chat_id).strip() != str(ADMIN_CHAT_ID).strip():
+            await update.message.reply_text(f"⛔ Nur für Admins. (Deine ID: {chat_id}, Konfiguriert: {ADMIN_CHAT_ID})")
+            return
+
+        pending = get_all_pending_orders()
+        
+        if not pending:
+            await update.message.reply_text("📋 Es liegen aktuell keine offenen Bestellungen vor.")
+            return
+        
+        await update.message.reply_text(f"📋 **{len(pending)} offene Bestellungen:**")
+        
+        for order in pending:
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Bestellt", callback_data=f"status_{order['row']}_BESTELLT"),
+                    InlineKeyboardButton("📦 Angekommen", callback_data=f"status_{order['row']}_ERHALTEN")
+                ],
+                [InlineKeyboardButton("❌ Stornieren", callback_data=f"status_{order['row']}_STORNIERT")]
+            ]
+            
+            text = (
+                f"🆔 **{order['order_number']}**\n"
+                f"👤 Von: {order['mitarbeiter']}\n"
+                f"📦 Artikel: *{order['artikel']}*\n"
+                f"🔢 Menge: {order['menge']}\n"
+                f"💰 Kostenstelle: {order['kostenstelle']}\n"
+                f"⏰ Dringlichkeit: {order['dringlichkeit']}\n"
+                f"📅 Datum: {order['timestamp']}"
+            )
+            
+            await update.message.reply_text(
+                text, 
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Error in admin_bestellungen_command: {e}")
+        await update.message.reply_text(f"❌ Fehler: {e}")
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """General admin menu shortcut."""
+    try:
+        chat_id = update.effective_chat.id
+        logger.info(f"Admin menu attempted by {chat_id}. Configured ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
+        
+        if not ADMIN_CHAT_ID or str(chat_id).strip() != str(ADMIN_CHAT_ID).strip():
+            await update.message.reply_text(f"⛔ Nur für Admins. (ID: {chat_id})")
+            return
+            
+        await update.message.reply_text(
+            "👑 **Admin Menü**\n\n"
+            "Verfügbare Befehle:\n"
+            "/admin_bestellungen - Offene Bestellungen verwalten\n"
+            "/statistik - Wochenstatistik\n"
+            "/meine_id - Deine Chat-ID prüfen",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error in admin_command: {e}")
+        await update.message.reply_text(f"❌ Fehler: {e}")
+
+
+async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle status update button press by admin."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    
+    if not ADMIN_CHAT_ID or str(chat_id) != str(ADMIN_CHAT_ID):
+        await query.answer("⛔ Nicht autorisiert.")
+        return
+        
+    await query.answer()
+    
+    # Extract data: status_ROW_NEWSTATUS
+    parts = query.data.split("_")
+    row_number = int(parts[1])
+    new_status = parts[2]
+    
+    if update_order_status(row_number, new_status):
+        status_text = "✅ Bestellt" if new_status == "BESTELLT" else "📦 Angekommen" if new_status == "ERHALTEN" else "❌ Storniert"
+        await query.edit_message_text(
+            f"{query.message.text}\n\n"
+            f"UPDATE: {status_text} am {datetime.now().strftime('%d.%m. %H:%M')}"
+        )
+    else:
+        await query.message.reply_text("❌ Fehler beim Aktualisieren des Status.")
+
+
+async def einladen_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Provide bot link for inviting others."""
+    bot_link = f"https://t.me/{(await context.bot.get_me()).username}"
+    
+    keyboard = [
+        [InlineKeyboardButton("📨 Bot teilen", url=f"https://t.me/share/url?url={bot_link}&text=Hier ist der Beschaffungs-Bot für unsere Bestellungen!")],
+    ]
+    
+    await update.message.reply_text(
+        f"🤝 **Leute einladen**\n\n"
+        f"Teile diesen Link mit deinen Kollegen, damit sie auch Bestellanfragen stellen können:\n\n"
+        f"{bot_link}\n\n"
+        f"Oder klicke auf den Button unten, um den Bot direkt in Telegram zu teilen.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show help message."""
     await update.message.reply_text(
@@ -667,12 +847,24 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/stornieren - Bestellung stornieren\n"
         "/suche [Begriff] - Bestellungen suchen\n"
         "/statistik - Wochenübersicht\n"
+        "/einladen - Kollegen einladen\n"
         "/abbrechen - Aktuelle Anfrage abbrechen\n"
         "/meine_id - Deine Chat-ID anzeigen\n"
         "/hilfe - Diese Hilfe anzeigen\n\n"
-        "Bei Problemen kontaktiere deinen Administrator.",
-        parse_mode="Markdown"
     )
+    
+    # Add admin commands to help if user is admin
+    chat_id = update.effective_chat.id
+    if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
+        message += (
+            "👑 **Admin-Befehle:**\n"
+            "/admin_bestellungen - Alle offenen Bestellungen verwalten\n"
+            "/statistik - Wochenstatistik anzeigen\n"
+        )
+    
+    message += "Bei Problemen kontaktiere deinen Administrator."
+    
+    await update.message.reply_text(message, parse_mode="Markdown")
 
 
 async def suche_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -764,6 +956,36 @@ async def send_weekly_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Could not send weekly summary: {e}")
 
 
+async def post_init(application: Application) -> None:
+    """Register bot commands for the dropdown menu."""
+    commands = [
+        BotCommand("start", "Neue Bestellung starten"),
+        BotCommand("meine_bestellungen", "Meine offenen Anfragen"),
+        BotCommand("stornieren", "Bestellung stornieren"),
+        BotCommand("suche", "Bestellungen suchen"),
+        BotCommand("einladen", "Kollegen einladen"),
+        BotCommand("hilfe", "Hilfe anzeigen"),
+    ]
+    await application.bot.set_my_commands(commands)
+    
+    # Register admin commands only for the admin
+    if ADMIN_CHAT_ID:
+        try:
+            admin_commands = commands + [
+                BotCommand("admin", "Admin-Menü öffnen"),
+                BotCommand("admin_bestellungen", "Alle offenen Bestellungen verwalten"),
+            ]
+            await application.bot.set_my_commands(
+                admin_commands, 
+                scope=BotCommandScopeChat(chat_id=int(ADMIN_CHAT_ID))
+            )
+            logger.info(f"👑 Admin commands registered for {ADMIN_CHAT_ID}")
+        except Exception as e:
+            logger.error(f"Could not register admin commands: {e}")
+            
+    logger.info("✅ Slash commands registered in Telegram menu.")
+
+
 def main() -> None:
     """Start the bot."""
     if not TELEGRAM_BOT_TOKEN:
@@ -771,7 +993,7 @@ def main() -> None:
         return
     
     # Create the Application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     
     # Order conversation handler
     order_conv_handler = ConversationHandler(
@@ -815,6 +1037,14 @@ def main() -> None:
     application.add_handler(CommandHandler("suche", suche_command))
     application.add_handler(CommandHandler("statistik", statistik_command))
     application.add_handler(CommandHandler("meine_id", get_my_id))
+    application.add_handler(CommandHandler("einladen", einladen_command))
+    application.add_handler(CommandHandler("invite", einladen_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("admin_bestellungen", admin_bestellungen_command))
+    application.add_handler(CommandHandler("bestellungen_admin", admin_bestellungen_command))
+    application.add_handler(CommandHandler("admin_bestellung", admin_bestellungen_command))
+    application.add_handler(CommandHandler("test", test_command))
+    application.add_handler(CallbackQueryHandler(status_callback, pattern="^status_"))
     application.add_handler(CommandHandler("hilfe", help_command))
     application.add_handler(CommandHandler("help", help_command))
     
@@ -823,6 +1053,7 @@ def main() -> None:
     
     # Start the bot
     logger.info("🚀 Bot is starting...")
+    logger.info(f"⚙️ Geladene ADMIN_CHAT_ID: '{ADMIN_CHAT_ID}'")
     if ADMIN_CHAT_ID:
         logger.info(f"📢 Admin notifications enabled for chat ID: {ADMIN_CHAT_ID}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
