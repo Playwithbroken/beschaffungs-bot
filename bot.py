@@ -842,7 +842,9 @@ async def einladen_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show help message."""
-    await update.message.reply_text(
+    chat_id = update.effective_chat.id
+    
+    help_text = (
         "🤖 **Beschaffungs-Bot Hilfe**\n\n"
         "**Befehle:**\n"
         "/start - Neue Bestellanfrage starten\n"
@@ -857,17 +859,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     
     # Add admin commands to help if user is admin
-    chat_id = update.effective_chat.id
-    if ADMIN_CHAT_ID and str(chat_id) == str(ADMIN_CHAT_ID):
-        message += (
+    if ADMIN_CHAT_ID and str(chat_id).strip() == str(ADMIN_CHAT_ID).strip():
+        help_text += (
             "👑 **Admin-Befehle:**\n"
             "/admin_bestellungen - Alle offenen Bestellungen verwalten\n"
             "/statistik - Wochenstatistik anzeigen\n"
+            "/admin - Admin-Hauptmenü\n\n"
         )
     
-    message += "Bei Problemen kontaktiere deinen Administrator."
+    help_text += "Bei Problemen kontaktiere deinen Administrator."
     
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
 async def suche_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
