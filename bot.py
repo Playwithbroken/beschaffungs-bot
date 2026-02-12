@@ -44,8 +44,10 @@ logger = logging.getLogger(__name__)
 
 # ============== CONFIGURATION ==============
 # Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # Optional: Get notified of new orders
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()  # Optional: Get notified of new orders
+if not ADMIN_CHAT_ID:
+    ADMIN_CHAT_ID = None
 
 # Google Sheets
 GOOGLE_SHEET_ID = "1nb7A0nCucAwz2ylBrIl65OQ5J3LgbqHErS5nkrK2rH0"
@@ -798,7 +800,8 @@ async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     chat_id = update.effective_chat.id
     
-    if not ADMIN_CHAT_ID or str(chat_id) != str(ADMIN_CHAT_ID):
+    # Secure check: ensure both IDs exist and match after stripping
+    if not ADMIN_CHAT_ID or str(chat_id).strip() != str(ADMIN_CHAT_ID).strip():
         await query.answer("⛔ Nicht autorisiert.")
         return
         
