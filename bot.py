@@ -123,7 +123,7 @@ def save_to_sheet(data: dict) -> tuple[bool, str]:
         order_number = get_next_order_number()
         
         # Prepare row data matching the columns:
-        # BestellNr | Timestamp | Mitarbeiter | ChatId | Artikel | Menge | Dringlichkeit | Kostenstelle | Bestellt? | Bestellt am
+        # BestellNr | Timestamp | Mitarbeiter | ChatId | Artikel | Menge | Dringlichkeit | Kostenstelle | Bestellt? | Bestellt am | Foto-ID
         row = [
             order_number,
             data["timestamp"],
@@ -133,8 +133,9 @@ def save_to_sheet(data: dict) -> tuple[bool, str]:
             data["menge"],
             data["dringlichkeit"],
             data["kostenstelle"],
-            "",  # Bestellt? - to be filled manually
-            ""   # Bestellt am - to be filled manually
+            "",  # Bestellt?
+            "",   # Bestellt am
+            data.get("foto_id", "")  # Column K: Foto-ID
         ]
         
         worksheet.append_row(row, value_input_option="USER_ENTERED")
@@ -355,7 +356,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     # Notify admin when a new user starts the bot
-    if ADMIN_CHAT_ID and str(user.id) != str(ADMIN_CHAT_ID):
+    if ADMIN_CHAT_ID and str(user.id).strip() != str(ADMIN_CHAT_ID).strip():
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
