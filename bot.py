@@ -19,6 +19,7 @@ from datetime import datetime, time, timedelta
 from dotenv import load_dotenv
 
 import gspread
+from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
@@ -104,6 +105,19 @@ ARTIKEL, MENGE, DRINGLICHKEIT, KOSTENSTELLE, FOTO, BESTAETIGUNG, STORNO_AUSWAHL 
 def get_google_sheet():
     """Connect to Google Sheets using service account."""
     try:
+        spreadsheet = get_google_spreadsheet()
+        if not spreadsheet:
+            return None
+
+        return spreadsheet.sheet1
+    except Exception as e:
+        logger.error(f"Error connecting to Google Sheets: {type(e).__name__}: {e}")
+        return None
+
+
+def get_google_spreadsheet():
+    """Connect to the Google spreadsheet using service account."""
+    try:
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
@@ -119,13 +133,186 @@ def get_google_sheet():
             credentials = Credentials.from_service_account_file("credentials.json", scopes=scopes)
 
         client = gspread.authorize(credentials)
-        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-        worksheet = spreadsheet.sheet1
-
-        return worksheet
+        return client.open_by_key(GOOGLE_SHEET_ID)
     except Exception as e:
-        logger.error(f"Error connecting to Google Sheets: {type(e).__name__}: {e}")
+        logger.error(f"Error connecting to Google spreadsheet: {type(e).__name__}: {e}")
         return None
+
+
+def get_user_sheet():
+    """Get or create the user registry worksheet."""
+    try:
+        spreadsheet = get_google_spreadsheet()
+        if not spreadsheet:
+            return None
+
+        try:
+            return spreadsheet.worksheet("Benutzer")
+        except WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="Benutzer", rows=1000, cols=8)
+            worksheet.append_row(
+                ["ChatId", "Vorname", "Nachname", "Username", "Rolle", "Blockiert", "Erster Start", "Letzter Start"],
+                value_input_option="USER_ENTERED"
+            )
+            return worksheet
+    except Exception as e:
+        logger.error(f"Error getting user sheet: {e}")
+        return None
+
+
+def role_name_for_user(chat_id: int | str) -> str:
+    """Return a readable role name."""
+    role = get_user_role(chat_id)
+    if role >= 2:
+        return "Super-Admin"
+    if role == 1:
+        return "Admin"
+    return "Benutzer"
+
+
+def record_known_user(user) -> None:
+    """Store or update a Telegram user in the user registry."""
+    try:
+        worksheet = get_user_sheet()
+        if not worksheet:
+            return
+
+        chat_id = str(user.id)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        all_values = worksheet.get_all_values()
+
+        target_row = None
+        for row_index, row in enumerate(all_values[1:], start=2):
+            if row and row[0] == chat_id:
+                target_row = row_index
+                break
+
+        row_data = [
+            chat_id,
+            user.first_name or "",
+            user.last_name or "",
+            user.username or "",
+            role_name_for_user(chat_id),
+            "Ja" if is_blocked_user(chat_id) else "Nein",
+            now,
+            now,
+        ]
+
+        if target_row:
+            first_seen = all_values[target_row - 1][6] if len(all_values[target_row - 1]) > 6 else now
+            row_data[6] = first_seen
+            worksheet.update(f"A{target_row}:H{target_row}", [row_data], value_input_option="USER_ENTERED")
+        else:
+            worksheet.append_row(row_data, value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.error(f"Error recording known user: {e}")
+
+
+def set_known_user_blocked_status(chat_id: int | str, blocked: bool) -> None:
+    """Update blocked status in the user registry if the user is known."""
+    try:
+        worksheet = get_user_sheet()
+        if not worksheet:
+            return
+
+        chat_id_str = str(chat_id)
+        all_values = worksheet.get_all_values()
+        for row_index, row in enumerate(all_values[1:], start=2):
+            if row and row[0] == chat_id_str:
+                worksheet.update_cell(row_index, 6, "Ja" if blocked else "Nein")
+                worksheet.update_cell(row_index, 5, role_name_for_user(chat_id_str))
+                return
+    except Exception as e:
+        logger.error(f"Error updating known user blocked status: {e}")
+
+
+def get_known_users() -> list[dict]:
+    """Return known users from the user registry and historic orders."""
+    users: dict[str, dict] = {}
+
+    try:
+        user_sheet = get_user_sheet()
+        if user_sheet:
+            for row in user_sheet.get_all_values()[1:]:
+                if not row or not row[0]:
+                    continue
+
+                chat_id = row[0]
+                users[chat_id] = {
+                    "chat_id": chat_id,
+                    "first_name": row[1] if len(row) > 1 else "",
+                    "last_name": row[2] if len(row) > 2 else "",
+                    "username": row[3] if len(row) > 3 else "",
+                    "role": role_name_for_user(chat_id),
+                    "blocked": is_blocked_user(chat_id),
+                    "first_seen": row[6] if len(row) > 6 else "",
+                    "last_seen": row[7] if len(row) > 7 else "",
+                    "source": "Benutzerliste",
+                }
+    except Exception as e:
+        logger.error(f"Error reading known users registry: {e}")
+
+    try:
+        order_sheet = get_google_sheet()
+        if order_sheet:
+            for row in order_sheet.get_all_values()[1:]:
+                if len(row) < 4 or not row[3]:
+                    continue
+
+                chat_id = row[3]
+                if chat_id in users:
+                    continue
+
+                users[chat_id] = {
+                    "chat_id": chat_id,
+                    "first_name": row[2] if len(row) > 2 else "",
+                    "last_name": "",
+                    "username": "",
+                    "role": role_name_for_user(chat_id),
+                    "blocked": is_blocked_user(chat_id),
+                    "first_seen": row[1] if len(row) > 1 else "",
+                    "last_seen": row[1] if len(row) > 1 else "",
+                    "source": "Bestellungen",
+                }
+    except Exception as e:
+        logger.error(f"Error reading known users from orders: {e}")
+
+    return sorted(users.values(), key=lambda item: item.get("last_seen") or "", reverse=True)
+
+
+def search_known_users(search_term: str) -> list[dict]:
+    """Search known users by id, name, username, role, or source."""
+    term = search_term.lower().strip()
+    if not term:
+        return get_known_users()
+
+    results = []
+    for user in get_known_users():
+        haystack = " ".join([
+            user.get("chat_id", ""),
+            user.get("first_name", ""),
+            user.get("last_name", ""),
+            user.get("username", ""),
+            user.get("role", ""),
+            user.get("source", ""),
+        ]).lower()
+        if term in haystack:
+            results.append(user)
+    return results
+
+
+def format_known_user(user: dict) -> str:
+    """Format a known user for Telegram messages."""
+    username = f"@{user['username']}" if user.get("username") else "kein Username"
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or "Unbekannt"
+    blocked = "Ja" if user.get("blocked") else "Nein"
+    return (
+        f"ID: {user['chat_id']}\n"
+        f"Name: {name} ({username})\n"
+        f"Rolle: {user.get('role', 'Benutzer')} | Blockiert: {blocked}\n"
+        f"Quelle: {user.get('source', '-')}\n"
+        f"Letzter Start/Eintrag: {user.get('last_seen') or '-'}"
+    )
 
 
 def get_next_order_number() -> str:
@@ -379,6 +566,7 @@ def get_weekly_summary() -> dict:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation and ask for the article."""
     user = update.effective_user
+    record_known_user(user)
 
     await update.message.reply_text(
         f"👋 Hallo {user.first_name}!\n\n"
@@ -802,6 +990,7 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if blocked_id not in BLOCKED_CHAT_IDS:
         BLOCKED_CHAT_IDS.append(blocked_id)
+        set_known_user_blocked_status(blocked_id, True)
         await update.message.reply_text(
             f"✅ ID `{blocked_id}` wurde blockiert.\n\n"
             f"*Wichtig:* Dauerhaft bleibt die Sperre nur, wenn du in Railway die Variable "
@@ -826,6 +1015,7 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     blocked_id = context.args[0].strip()
     if blocked_id in BLOCKED_CHAT_IDS:
         BLOCKED_CHAT_IDS.remove(blocked_id)
+        set_known_user_blocked_status(blocked_id, False)
         await update.message.reply_text(
             f"✅ ID `{blocked_id}` wurde entsperrt.\n\n"
             f"Aktuelle Railway-Variable: `BLOCKED_CHAT_IDS={format_id_list(BLOCKED_CHAT_IDS)}`",
@@ -847,6 +1037,56 @@ async def blocked_list_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+def user_action_keyboard(user: dict) -> InlineKeyboardMarkup | None:
+    """Build block/unblock action keyboard for a known user."""
+    if is_any_admin(user["chat_id"]):
+        return None
+
+    if user.get("blocked"):
+        button = InlineKeyboardButton("✅ Entsperren", callback_data=f"unblock_user_{user['chat_id']}")
+    else:
+        button = InlineKeyboardButton("🚫 Blockieren", callback_data=f"block_user_{user['chat_id']}")
+    return InlineKeyboardMarkup([[button]])
+
+
+async def send_known_users(update: Update, users: list[dict], title: str) -> None:
+    """Send known users as separate Telegram messages with action buttons."""
+    if not users:
+        await update.message.reply_text("Keine Benutzer gefunden.")
+        return
+
+    shown_users = users[:20]
+    await update.message.reply_text(f"{title}\nGefunden: {len(users)}. Angezeigt: {len(shown_users)}.")
+    for user in shown_users:
+        await update.message.reply_text(
+            format_known_user(user),
+            reply_markup=user_action_keyboard(user)
+        )
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show known users (Admin only)."""
+    if not is_any_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Nur für Administratoren.")
+        return
+
+    await send_known_users(update, get_known_users(), "👥 Bekannte Benutzer")
+
+
+async def users_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search known users (Admin only)."""
+    if not is_any_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Nur für Administratoren.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Verwendung: /benutzer_suche [Name, Username oder ID]")
+        return
+
+    search_term = " ".join(context.args)
+    await send_known_users(update, search_known_users(search_term), f"🔍 Benutzer-Suche: {search_term}")
+
+
 async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle admin block button from new-user notification."""
     query = update.callback_query
@@ -863,13 +1103,35 @@ async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if blocked_id not in BLOCKED_CHAT_IDS:
         BLOCKED_CHAT_IDS.append(blocked_id)
+    set_known_user_blocked_status(blocked_id, True)
 
     await query.answer("Benutzer blockiert.")
     await query.edit_message_text(
         f"{query.message.text}\n\n"
         f"🚫 Blockiert durch {update.effective_user.first_name}.\n"
-        f"Railway dauerhaft setzen: `BLOCKED_CHAT_IDS={format_id_list(BLOCKED_CHAT_IDS)}`",
-        parse_mode="Markdown"
+        f"Railway dauerhaft setzen: BLOCKED_CHAT_IDS={format_id_list(BLOCKED_CHAT_IDS)}"
+    )
+
+
+async def unblock_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle admin unblock button from user list."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+
+    if not is_any_admin(user_id):
+        await query.answer("⛔ Nicht autorisiert.")
+        return
+
+    blocked_id = query.data.replace("unblock_user_", "", 1).strip()
+    if blocked_id in BLOCKED_CHAT_IDS:
+        BLOCKED_CHAT_IDS.remove(blocked_id)
+    set_known_user_blocked_status(blocked_id, False)
+
+    await query.answer("Benutzer entsperrt.")
+    await query.edit_message_text(
+        f"{query.message.text}\n\n"
+        f"✅ Entsperrt durch {update.effective_user.first_name}.\n"
+        f"Railway dauerhaft setzen: BLOCKED_CHAT_IDS={format_id_list(BLOCKED_CHAT_IDS)}"
     )
 
 
@@ -961,6 +1223,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"👑 **Admin Menü ({role_name})**\n\n"
             "Verfügbare Befehle:\n"
             "/admin_bestellungen - Offene Bestellungen verwalten\n"
+            "/benutzer - Bekannte Benutzer anzeigen\n"
+            "/benutzer_suche [Begriff] - Benutzer suchen\n"
             "/statistik - Wochenstatistik\n"
             "/meine_id - Deine Chat-ID prüfen",
             parse_mode="Markdown"
@@ -1045,6 +1309,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"👑 **{role_name}-Befehle:**\n"
             "/admin_bestellungen - Offene Bestellungen verwalten\n"
             "/suche [Begriff] - In allen Bestellungen suchen\n"
+            "/benutzer - Bekannte Benutzer anzeigen\n"
+            "/benutzer_suche [Begriff] - Benutzer suchen\n"
             "/statistik - Wochenstatistik anzeigen\n"
             "/block [ID] - Benutzer blockieren\n"
             "/unblock [ID] - Benutzer entsperren\n"
@@ -1174,6 +1440,8 @@ async def post_init(application: Application) -> None:
                 BotCommand("admin", "Admin-Menü öffnen"),
                 BotCommand("admin_bestellungen", "Alle offenen Bestellungen verwalten"),
                 BotCommand("suche", "Bestellungen suchen"),
+                BotCommand("benutzer", "Bekannte Benutzer anzeigen"),
+                BotCommand("benutzer_suche", "Benutzer suchen"),
                 BotCommand("statistik", "Wochenstatistik anzeigen"),
                 BotCommand("block", "Benutzer blockieren"),
                 BotCommand("unblock", "Benutzer entsperren"),
@@ -1253,6 +1521,7 @@ def main() -> None:
     application.add_handler(CommandHandler("admin_bestellung", admin_bestellungen_command))
     application.add_handler(CommandHandler("test", test_command))
     application.add_handler(CallbackQueryHandler(block_user_callback, pattern="^block_user_"))
+    application.add_handler(CallbackQueryHandler(unblock_user_callback, pattern="^unblock_user_"))
     application.add_handler(CallbackQueryHandler(status_callback, pattern="^status_"))
     application.add_handler(CommandHandler("hilfe", help_command))
     application.add_handler(CommandHandler("help", help_command))
@@ -1260,6 +1529,8 @@ def main() -> None:
     application.add_handler(CommandHandler("block", block_command))
     application.add_handler(CommandHandler("unblock", unblock_command))
     application.add_handler(CommandHandler("blockierte", blocked_list_command))
+    application.add_handler(CommandHandler("benutzer", users_command))
+    application.add_handler(CommandHandler("benutzer_suche", users_search_command))
 
     # Weekly summary: Use /statistik command manually
     # Automatic scheduling requires 24/7 hosting
