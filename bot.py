@@ -59,6 +59,10 @@ ADMIN_CHAT_IDS = [id.strip() for id in os.getenv("ADMIN_CHAT_ID", "").split(",")
 # Super-Admin IDs (Full control) - can be comma-separated list
 SUPER_ADMIN_IDS = [id.strip() for id in os.getenv("SUPER_ADMIN_IDS", "").split(",") if id.strip()]
 
+# Order notification recipients - can be comma-separated list.
+# Falls back to ADMIN_CHAT_ID when empty.
+ORDER_NOTIFY_CHAT_IDS = [id.strip() for id in os.getenv("ORDER_NOTIFY_CHAT_IDS", "").split(",") if id.strip()]
+
 # Blocked Telegram user IDs - can be comma-separated list
 BLOCKED_CHAT_IDS = [id.strip() for id in os.getenv("BLOCKED_CHAT_IDS", "").split(",") if id.strip()]
 
@@ -82,6 +86,18 @@ def is_blocked_user(chat_id: int | str) -> bool:
 def format_id_list(ids: list[str]) -> str:
     """Format ID list for admin replies."""
     return ", ".join(ids) if ids else "keine"
+
+def unique_ids(ids: list[str]) -> list[str]:
+    """Return IDs without duplicates while preserving order."""
+    return list(dict.fromkeys([str(chat_id).strip() for chat_id in ids if str(chat_id).strip()]))
+
+def get_order_notification_chat_ids() -> list[str]:
+    """Return chat IDs that should receive new order notifications."""
+    return unique_ids(ORDER_NOTIFY_CHAT_IDS or ADMIN_CHAT_IDS)
+
+def google_sheet_url() -> str:
+    """Return a direct link to the configured Google Sheet."""
+    return f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit"
 
 # Google Sheets
 GOOGLE_SHEET_ID = "1nb7A0nCucAwz2ylBrIl65OQ5J3LgbqHErS5nkrK2rH0"
@@ -783,29 +799,34 @@ async def save_order(update, context: ContextTypes.DEFAULT_TYPE, from_callback: 
             f"🆕 /start - Neue Anfrage"
         )
 
-        # Notify admins if configured
-        if ADMIN_CHAT_IDS:
-            for admin_id in ADMIN_CHAT_IDS:
+        # Notify configured buyers/admins when the order is saved in Google Sheets.
+        notify_chat_ids = get_order_notification_chat_ids()
+        if notify_chat_ids:
+            for notify_id in notify_chat_ids:
                 try:
                     await context.bot.send_message(
-                        chat_id=admin_id,
+                        chat_id=notify_id,
                         text=f"🆕 Neue Bestellung {order_number}\n\n"
+                             f"Die Bestellung wurde im Google Sheet eingetragen.\n\n"
                              f"👤 Von: {data['mitarbeiter']}\n"
                              f"📦 Artikel: {data['artikel']}\n"
                              f"🔢 Menge: {data['menge']}\n"
                              f"⏰ Dringlichkeit: {data['dringlichkeit']}\n"
-                             f"💰 Kostenstelle: {data['kostenstelle']}"
+                             f"💰 Kostenstelle: {data['kostenstelle']}",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("📊 Spreadsheet öffnen", url=google_sheet_url())]
+                        ])
                     )
 
                     # Send photo to admin if available
                     if data["foto_id"]:
                         await context.bot.send_photo(
-                            chat_id=admin_id,
+                            chat_id=notify_id,
                             photo=data["foto_id"],
                             caption=f"📸 Foto für Bestellung {order_number}"
                         )
                 except Exception as e:
-                    logger.error(f"Could not notify admin {admin_id}: {e}")
+                    logger.error(f"Could not notify order recipient {notify_id}: {e}")
     else:
         await send_message(
             f"❌ Fehler beim Speichern!\n\n"
@@ -1037,6 +1058,76 @@ async def blocked_list_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def notification_recipients_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show order notification recipients (Admin only)."""
+    if not is_any_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Nur für Administratoren.")
+        return
+
+    recipients = get_order_notification_chat_ids()
+    source = "ORDER_NOTIFY_CHAT_IDS" if ORDER_NOTIFY_CHAT_IDS else "ADMIN_CHAT_ID (Fallback)"
+    await update.message.reply_text(
+        f"🔔 **Bestell-Benachrichtigungen**\n\n"
+        f"Empfänger: `{format_id_list(recipients)}`\n"
+        f"Quelle: `{source}`\n\n"
+        f"Dauerhaft in Railway setzen:\n"
+        f"`ORDER_NOTIFY_CHAT_IDS={format_id_list(recipients)}`",
+        parse_mode="Markdown"
+    )
+
+
+async def notification_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Temporarily add an order notification recipient (SuperAdmin only)."""
+    user_id = update.effective_user.id
+    if get_user_role(user_id) < 2:
+        await update.message.reply_text("⛔ Nur Super-Admins können Benachrichtigungen ändern.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Verwendung: `/notify_add [Telegram-ID]`", parse_mode="Markdown")
+        return
+
+    notify_id = context.args[0].strip()
+    if not ORDER_NOTIFY_CHAT_IDS:
+        ORDER_NOTIFY_CHAT_IDS.extend(get_order_notification_chat_ids())
+
+    if notify_id not in ORDER_NOTIFY_CHAT_IDS:
+        ORDER_NOTIFY_CHAT_IDS.append(notify_id)
+
+    await update.message.reply_text(
+        f"✅ ID `{notify_id}` bekommt jetzt Bestell-Pushnachrichten.\n\n"
+        f"*Wichtig:* Dauerhaft in Railway setzen:\n"
+        f"`ORDER_NOTIFY_CHAT_IDS={format_id_list(get_order_notification_chat_ids())}`",
+        parse_mode="Markdown"
+    )
+
+
+async def notification_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Temporarily remove an order notification recipient (SuperAdmin only)."""
+    user_id = update.effective_user.id
+    if get_user_role(user_id) < 2:
+        await update.message.reply_text("⛔ Nur Super-Admins können Benachrichtigungen ändern.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Verwendung: `/notify_remove [Telegram-ID]`", parse_mode="Markdown")
+        return
+
+    notify_id = context.args[0].strip()
+    if not ORDER_NOTIFY_CHAT_IDS:
+        ORDER_NOTIFY_CHAT_IDS.extend(get_order_notification_chat_ids())
+
+    if notify_id in ORDER_NOTIFY_CHAT_IDS:
+        ORDER_NOTIFY_CHAT_IDS.remove(notify_id)
+
+    await update.message.reply_text(
+        f"✅ ID `{notify_id}` wurde aus den Bestell-Pushnachrichten entfernt.\n\n"
+        f"*Wichtig:* Dauerhaft in Railway setzen:\n"
+        f"`ORDER_NOTIFY_CHAT_IDS={format_id_list(get_order_notification_chat_ids())}`",
+        parse_mode="Markdown"
+    )
+
+
 def user_action_keyboard(user: dict) -> InlineKeyboardMarkup | None:
     """Build block/unblock action keyboard for a known user."""
     if is_any_admin(user["chat_id"]):
@@ -1225,6 +1316,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/admin_bestellungen - Offene Bestellungen verwalten\n"
             "/benutzer - Bekannte Benutzer anzeigen\n"
             "/benutzer_suche [Begriff] - Benutzer suchen\n"
+            "/benachrichtigungen - Push-Empfänger anzeigen\n"
             "/statistik - Wochenstatistik\n"
             "/meine_id - Deine Chat-ID prüfen",
             parse_mode="Markdown"
@@ -1311,6 +1403,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "/suche [Begriff] - In allen Bestellungen suchen\n"
             "/benutzer - Bekannte Benutzer anzeigen\n"
             "/benutzer_suche [Begriff] - Benutzer suchen\n"
+            "/benachrichtigungen - Push-Empfänger anzeigen\n"
+            "/notify_add [ID] - Push-Empfänger hinzufügen\n"
+            "/notify_remove [ID] - Push-Empfänger entfernen\n"
             "/statistik - Wochenstatistik anzeigen\n"
             "/block [ID] - Benutzer blockieren\n"
             "/unblock [ID] - Benutzer entsperren\n"
@@ -1442,6 +1537,9 @@ async def post_init(application: Application) -> None:
                 BotCommand("suche", "Bestellungen suchen"),
                 BotCommand("benutzer", "Bekannte Benutzer anzeigen"),
                 BotCommand("benutzer_suche", "Benutzer suchen"),
+                BotCommand("benachrichtigungen", "Push-Empfänger anzeigen"),
+                BotCommand("notify_add", "Push-Empfänger hinzufügen"),
+                BotCommand("notify_remove", "Push-Empfänger entfernen"),
                 BotCommand("statistik", "Wochenstatistik anzeigen"),
                 BotCommand("block", "Benutzer blockieren"),
                 BotCommand("unblock", "Benutzer entsperren"),
@@ -1531,6 +1629,9 @@ def main() -> None:
     application.add_handler(CommandHandler("blockierte", blocked_list_command))
     application.add_handler(CommandHandler("benutzer", users_command))
     application.add_handler(CommandHandler("benutzer_suche", users_search_command))
+    application.add_handler(CommandHandler("benachrichtigungen", notification_recipients_command))
+    application.add_handler(CommandHandler("notify_add", notification_add_command))
+    application.add_handler(CommandHandler("notify_remove", notification_remove_command))
 
     # Weekly summary: Use /statistik command manually
     # Automatic scheduling requires 24/7 hosting
@@ -1539,8 +1640,11 @@ def main() -> None:
     logger.info("🚀 Bot is starting...")
     logger.info(f"⚙️ Geladene Admins: {len(ADMIN_CHAT_IDS)}")
     logger.info(f"⚙️ Geladene Super-Admins: {len(SUPER_ADMIN_IDS)}")
+    logger.info(f"⚙️ Geladene Bestell-Push-Empfänger: {len(get_order_notification_chat_ids())}")
     if ADMIN_CHAT_IDS:
         logger.info(f"📢 Admin notifications enabled for: {', '.join(ADMIN_CHAT_IDS)}")
+    if get_order_notification_chat_ids():
+        logger.info(f"🔔 Order notifications enabled for: {', '.join(get_order_notification_chat_ids())}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
