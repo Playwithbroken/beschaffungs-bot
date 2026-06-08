@@ -1,0 +1,6 @@
+.git
+.qoder
+.venv
+__pycache__
+*.pyc
+.env
